@@ -1,8 +1,11 @@
 package com.systemspecs.testProxy.controller;
 
 // Necessary imports
+import com.systemspecs.testProxy.wrapper.SerializableResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.HttpStatusCodeException;
@@ -12,50 +15,52 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.Logger;
 
 import java.util.Map;
+import java.util.Objects;
 
 // Marks the class as a REST controller
 @RestController
-// Base URL for all routes in this controller
 @RequestMapping("/proxy")
 public class testProxyController {
-    // Logger instance for logging events
     private static final Logger logger = LoggerFactory.getLogger(testProxyController.class);
 
-    // Injects RestTemplate bean
     @Autowired
     private RestTemplate restTemplate;
 
-    // Handles routing of requests
+    @Autowired
+    private CacheManager cacheManager;
+
     @RequestMapping("/router/")
     public ResponseEntity<?> routeRequest(
             @RequestHeader Map<String, String> header,
             @RequestBody(required = false) Map<String, Object> body,
             HttpServletRequest request
     ) {
-        // Retrieve the URL from headers
         String url = header.get("url");
-        // Return a bad request if URL is missing
         if (url == null) {
             return ResponseEntity.badRequest().body("Missing URL in headers");
         }
 
-        // Get the HTTP method of the incoming request
         HttpMethod method = HttpMethod.valueOf(request.getMethod().toUpperCase());
 
         try {
-            // Initialize headers for the outgoing request
-            HttpHeaders headers = new HttpHeaders();
-            // Remove the URL from headers as it's not needed in the forwarded request
-            header.remove("url");
+            if (method == HttpMethod.GET) {
+                // Check cache first
+                Cache cache = cacheManager.getCache("proxyResponses");
+                assert cache != null;
+                SerializableResponse cachedResponse = cache.get(url, SerializableResponse.class);
+                if (cachedResponse != null) {
+                    return cachedResponse.toResponseEntity();
+                }
+            }
 
-            // Copy all headers except CONTENT_LENGTH and HOST to the outgoing request
+            HttpHeaders headers = new HttpHeaders();
+            header.remove("url");
             header.forEach((key, value) -> {
                 if (!key.equalsIgnoreCase(HttpHeaders.CONTENT_LENGTH) && !key.equalsIgnoreCase(HttpHeaders.HOST)) {
                     headers.set(key, value);
                 }
             });
 
-            // Prepare the entity for the outgoing request
             HttpEntity<?> requestEntity;
             if (method == HttpMethod.GET || method == HttpMethod.DELETE) {
                 requestEntity = new HttpEntity<>(headers);
@@ -65,22 +70,23 @@ public class testProxyController {
                 requestEntity = new HttpEntity<>(headers);
             }
 
-            // Send the request to the specified URL
             ResponseEntity<byte[]> response = restTemplate.exchange(url, method, requestEntity, byte[].class);
 
-            // Initialize headers for the response
+            if (method == HttpMethod.GET) {
+                // Cache the response
+                SerializableResponse serializableResponse = SerializableResponse.fromResponseEntity(response);
+                Objects.requireNonNull(cacheManager.getCache("proxyResponses")).put(url, serializableResponse);
+            }
+
             HttpHeaders responseHeaders = new HttpHeaders();
-            // Copy all headers except TRANSFER_ENCODING to the response
             response.getHeaders().forEach((key, value) -> {
                 if (!key.equalsIgnoreCase(HttpHeaders.TRANSFER_ENCODING)) {
                     responseHeaders.put(key, value);
                 }
             });
 
-            // Return the response from the external service to the client
             return new ResponseEntity<>(response.getBody(), responseHeaders, response.getStatusCode());
         } catch (HttpStatusCodeException ex) {
-            // Log the exception and return the status code and body of the error response
             logger.error("HttpStatusCodeException: {}", ex.getResponseBodyAsString(), ex);
             return ResponseEntity.status(ex.getStatusCode()).body(ex.getResponseBodyAsString());
         }
